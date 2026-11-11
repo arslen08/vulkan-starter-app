@@ -646,6 +646,7 @@ bool initialize(GLFWwindow* const window) {
 		std::cerr << "Failed to create Vulkan command pool\n";
 		return false;
 	}
+	context.command_pool = vk_command_pool;
 
 	const VkCommandBufferAllocateInfo command_buffers = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -679,7 +680,7 @@ void shutdown() {
 	vkDestroyRenderPass(context.device, vk_imgui_render_pass, nullptr);
 	vkDestroyDescriptorPool(context.device, vk_imgui_descriptor_pool, nullptr);
 
-	vkDestroyCommandPool(context.device, vk_command_pool, nullptr);
+	vkDestroyCommandPool(context.device, context.command_pool, nullptr);
 
 	vkDestroyFence(context.device, vk_fence_frame_in_flight, nullptr);
 	for (size_t i = 0, n = vk_swapchain_images.size(); i < n; ++i) {

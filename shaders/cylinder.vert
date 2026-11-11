@@ -2,7 +2,7 @@
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
-layout(location = 2) in vec3 inColor;
+layout(location = 2) in vec2 inUV;
 
 layout(set = 0, binding = 0) uniform Scene {
 	mat4 viewProjection;
@@ -12,7 +12,7 @@ layout(set = 0, binding = 0) uniform Scene {
 	vec4 directionalColor;
 } scene;
 
-layout(set = 1, binding = 0) uniform Model {
+layout(set = 0, binding = 1) uniform Model {
 	mat4 model;
 	mat4 normalMatrix;
 	vec4 albedo;
@@ -20,13 +20,13 @@ layout(set = 1, binding = 0) uniform Model {
 } object;
 
 layout(location = 0) out vec3 normal;
-layout(location = 1) out vec3 vertexColor;
+layout(location = 1) out vec2 uv;
 layout(location = 2) out vec3 worldPosition;
 
 void main() {
 	vec4 world = object.model * vec4(inPosition, 1.0);
 	gl_Position = scene.viewProjection * world;
 	normal = normalize(mat3(object.normalMatrix) * inNormal);
-	vertexColor = inColor;
+	uv = inUV;
 	worldPosition = world.xyz;
 }

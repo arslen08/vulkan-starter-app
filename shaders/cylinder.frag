@@ -1,7 +1,7 @@
 #version 450
 
 layout(location = 0) in vec3 normal;
-layout(location = 1) in vec3 vertexColor;
+layout(location = 1) in vec2 uv;
 layout(location = 2) in vec3 worldPosition;
 layout(location = 0) out vec4 outColor;
 
@@ -13,12 +13,14 @@ layout(set = 0, binding = 0) uniform Scene {
 	vec4 directionalColor;
 } scene;
 
-layout(set = 1, binding = 0) uniform Model {
+layout(set = 0, binding = 1) uniform Model {
 	mat4 model;
 	mat4 normalMatrix;
 	vec4 albedo;
 	vec4 specular;
 } object;
+
+layout(set = 0, binding = 2) uniform sampler2D albedoTexture;
 
 vec3 safeNormalize(vec3 value) {
 	float lengthSquared = dot(value, value);
@@ -38,7 +40,8 @@ vec3 blinnPhong(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 baseColor) {
 void main() {
 	vec3 N = safeNormalize(normal);
 	vec3 V = safeNormalize(scene.cameraPosition.xyz - worldPosition);
-	vec3 baseColor = vertexColor * object.albedo.rgb;
+	vec3 texColor = texture(albedoTexture, uv).rgb;
+	vec3 baseColor = texColor * object.albedo.rgb;
 	vec3 lighting = scene.ambient.rgb * baseColor;
 
 	if (scene.directionalColor.w > 0.0) {

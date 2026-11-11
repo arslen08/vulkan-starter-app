@@ -4,6 +4,9 @@
 
 #include <vulkan/vulkan.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -13,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace application {
@@ -21,8 +25,11 @@ namespace {
 
 constexpr uint32_t cylinder_segments = 50;
 constexpr float pi = 3.14159265358979323846f;
-constexpr float floor_height = -2.5f;
-constexpr float floor_half_size = 10.0f;
+
+struct Vec2 {
+	float u;
+	float v;
+};
 
 struct Vec3 {
 	float x;
@@ -33,7 +40,7 @@ struct Vec3 {
 struct Vertex {
 	Vec3 position;
 	Vec3 normal;
-	Vec3 color;
+	Vec2 uv;
 };
 
 struct Matrix {
@@ -45,14 +52,15 @@ struct SceneUniform {
 	float camera_position[4];
 	float ambient[4];
 	float directional_direction[4];
-	float directional_color[4]; 
+	float directional_color[4];
 };
 
 struct ModelUniform {
 	Matrix model;
 	Matrix normal_matrix;
 	float albedo[4];
-	float specular[4]; 
+	float specular[4];
+	float _pad[4];
 };
 
 struct Material {
@@ -78,32 +86,48 @@ struct HostBuffer {
 	void* data = nullptr;
 };
 
-struct Model {
-	Mesh mesh;
-	HostBuffer uniform;
-	VkDescriptorSet set = VK_NULL_HANDLE;
+struct Texture {
+	VkImage image = VK_NULL_HANDLE;
+	VmaAllocation allocation = VK_NULL_HANDLE;
+	VkImageView view = VK_NULL_HANDLE;
+	VkSampler sampler = VK_NULL_HANDLE;
+	uint32_t width = 0;
+	uint32_t height = 0;
 };
 
-constexpr size_t cylinder_index = 0;
-constexpr size_t floor_index = 1;
+struct Model {
+	Mesh mesh;
+};
+
 constexpr size_t model_count = 2;
 
-VkPipeline graphics_pipeline;
-VkPipelineLayout pipeline_layout;
-VkDescriptorSetLayout scene_set_layout;
-VkDescriptorSetLayout model_set_layout;
-VkDescriptorPool descriptor_pool;
-VkDescriptorSet scene_set;
+VkPipeline graphics_pipeline = VK_NULL_HANDLE;
+VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
+VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+
 HostBuffer scene_buffer;
+HostBuffer model_uniforms_buffer;
 std::array<Model, model_count> models;
+Texture albedo_texture;
+
+VkDeviceSize model_uniform_alignment = 256;
+VkDeviceSize model_uniform_size = 0;
 
 Projection projection = Projection::perspective;
-float translation[3] = { 0.0f, 0.0f, 0.0f };
-float rotation[3] = { 20.0f, -25.0f, 0.0f };
-float scale[3] = { 1.0f, 1.0f, 1.0f };
+
+float translation0[3] = { -1.5f, 0.0f, 0.0f };
+float rotation0[3] = { 20.0f, -25.0f, 0.0f };
+float scale0[3] = { 1.0f, 1.0f, 1.0f };
+
+float translation1[3] = { 1.5f, 0.0f, 0.0f };
+float rotation1[3] = { -15.0f, 40.0f, 10.0f };
+float scale1[3] = { 0.8f, 0.8f, 0.8f };
+
 std::array<Material, model_count> materials = {{
 	{ { 1.0f, 1.0f, 1.0f }, { 1.0f, 1.0f, 1.0f }, 64.0f },
-	{ { 0.7f, 0.7f, 0.7f }, { 0.3f, 0.3f, 0.3f }, 16.0f },
+	{ { 1.0f, 1.0f, 1.0f }, { 0.6f, 0.6f, 0.6f }, 32.0f },
 }};
 
 float camera_position[3] = { 0.0f, 1.0f, 6.0f };
@@ -121,15 +145,15 @@ float directional_color[3] = { 1.0f, 1.0f, 1.0f };
 float directional_intensity = 0.6f;
 
 bool animation_playing = true;
-float animation_phase;
+float animation_phase = 0.0f;
 float animation_speed = 1.0f;
-float trajectory_radius = 0.75f;
-float trajectory_depth = 0.45f;
-float trajectory_height = 0.35f;
+float trajectory_radius = 0.5f;
+float trajectory_depth = 0.3f;
+float trajectory_height = 0.25f;
 float trajectory_frequency = 2.0f;
 float animation_rotation_speed = 45.0f;
-double previous_update_time;
-bool has_previous_update_time;
+double previous_update_time = 0.0;
+bool has_previous_update_time = false;
 
 Matrix identityMatrix() {
 	Matrix result{};
@@ -250,24 +274,17 @@ void normalize3(const float in[3], float out[3], const float fallback[3]) {
 	out[2] = in[2] / length;
 }
 
-void addVertex(std::vector<Vertex>& vertices, Vec3 position, Vec3 normal, Vec3 color) {
-	vertices.push_back({ position, normal, color });
-}
-
-Vec3 gradientColor(Vec3 position) {
-	return {
-		0.5f * (position.x + 1.0f),
-		0.5f * (position.y + 1.0f),
-		0.5f * (position.z + 1.0f),
-	};
+void addVertex(std::vector<Vertex>& vertices, Vec3 position, Vec3 normal, Vec2 uv) {
+	vertices.push_back({ position, normal, uv });
 }
 
 void addTriangle(std::vector<Vertex>& vertices,
                  Vec3 a, Vec3 b, Vec3 c,
-                 Vec3 normal_a, Vec3 normal_b, Vec3 normal_c) {
-	addVertex(vertices, a, normal_a, gradientColor(a));
-	addVertex(vertices, b, normal_b, gradientColor(b));
-	addVertex(vertices, c, normal_c, gradientColor(c));
+                 Vec3 normal_a, Vec3 normal_b, Vec3 normal_c,
+                 Vec2 uv_a, Vec2 uv_b, Vec2 uv_c) {
+	addVertex(vertices, a, normal_a, uv_a);
+	addVertex(vertices, b, normal_b, uv_b);
+	addVertex(vertices, c, normal_c, uv_c);
 }
 
 std::vector<Vertex> createCylinder() {
@@ -285,6 +302,9 @@ std::vector<Vertex> createCylinder() {
 		const float x1 = radius * std::cos(angle1);
 		const float z1 = radius * std::sin(angle1);
 
+		const float u0 = static_cast<float>(i) / cylinder_segments;
+		const float u1 = static_cast<float>(i + 1) / cylinder_segments;
+
 		const Vec3 bottom0{ x0, -half_height, z0 };
 		const Vec3 top0{ x0, half_height, z0 };
 		const Vec3 bottom1{ x1, -half_height, z1 };
@@ -292,33 +312,30 @@ std::vector<Vertex> createCylinder() {
 		const Vec3 normal0{ std::cos(angle0), 0.0f, std::sin(angle0) };
 		const Vec3 normal1{ std::cos(angle1), 0.0f, std::sin(angle1) };
 
-		addTriangle(vertices, bottom0, top0, top1, normal0, normal0, normal1);
-		addTriangle(vertices, bottom0, top1, bottom1, normal0, normal1, normal1);
+		addTriangle(vertices, bottom0, top0, top1, normal0, normal0, normal1,
+		            { u0, 0.0f }, { u0, 1.0f }, { u1, 1.0f });
+		addTriangle(vertices, bottom0, top1, bottom1, normal0, normal1, normal1,
+		            { u0, 0.0f }, { u1, 1.0f }, { u1, 0.0f });
 
 		const Vec3 top_center{ 0.0f, half_height, 0.0f };
 		const Vec3 bottom_center{ 0.0f, -half_height, 0.0f };
 		const Vec3 top_normal{ 0.0f, 1.0f, 0.0f };
 		const Vec3 bottom_normal{ 0.0f, -1.0f, 0.0f };
-		addTriangle(vertices, top_center, top1, top0, top_normal, top_normal, top_normal);
+
+		const Vec2 uv_tc{ 0.5f, 0.5f };
+		const Vec2 uv_t0{ 0.5f + 0.5f * x0, 0.5f + 0.5f * z0 };
+		const Vec2 uv_t1{ 0.5f + 0.5f * x1, 0.5f + 0.5f * z1 };
+		addTriangle(vertices, top_center, top1, top0, top_normal, top_normal, top_normal,
+		            uv_tc, uv_t1, uv_t0);
+
+		const Vec2 uv_bc{ 0.5f, 0.5f };
+		const Vec2 uv_b0{ 0.5f + 0.5f * x0, 0.5f + 0.5f * z0 };
+		const Vec2 uv_b1{ 0.5f + 0.5f * x1, 0.5f + 0.5f * z1 };
 		addTriangle(vertices, bottom_center, bottom0, bottom1,
-		            bottom_normal, bottom_normal, bottom_normal);
+		            bottom_normal, bottom_normal, bottom_normal,
+		            uv_bc, uv_b0, uv_b1);
 	}
 
-	return vertices;
-}
-
-std::vector<Vertex> createFloor() {
-	std::vector<Vertex> vertices;
-	const Vec3 normal{ 0.0f, 1.0f, 0.0f };
-	const Vec3 color{ 1.0f, 1.0f, 1.0f };
-	const float h = floor_half_size;
-	const Vec3 a{ -h, 0.0f, -h };
-	const Vec3 b{ -h, 0.0f, h };
-	const Vec3 c{ h, 0.0f, h };
-	const Vec3 d{ h, 0.0f, -h };
-	for (const Vec3& p : { a, b, c, a, c, d }) {
-		addVertex(vertices, p, normal, color);
-	}
 	return vertices;
 }
 
@@ -358,62 +375,273 @@ bool uploadToBuffer(const HostBuffer& buffer, const void* data, size_t size) {
 	return true;
 }
 
-bool createMesh(Mesh& mesh, const std::vector<Vertex>& vertices, const char* name) {
-	HostBuffer host;
-	if (!createHostBuffer(host, vertices.size() * sizeof(Vertex),
-	                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, name)) {
+bool createDeviceLocalBuffer(VkBuffer& buffer, VmaAllocation& allocation, VkDeviceSize size,
+                             VkBufferUsageFlags usage, const void* data, const char* name) {
+	auto& context = graphics::internal::context;
+
+	HostBuffer staging{};
+	if (!createHostBuffer(staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "staging")) {
 		return false;
 	}
-	mesh.buffer = host.buffer;
-	mesh.allocation = host.allocation;
+	std::memcpy(staging.data, data, static_cast<size_t>(size));
+	vmaFlushAllocation(context.allocator, staging.allocation, 0, size);
+
+	const VkBufferCreateInfo buffer_info = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = size,
+		.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	const VmaAllocationCreateInfo alloc_info = {
+		.flags = 0,
+		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+	};
+	if (vmaCreateBuffer(context.allocator, &buffer_info, &alloc_info, &buffer, &allocation,
+	                    nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to create device-local buffer: " << name << '\n';
+		vmaDestroyBuffer(context.allocator, staging.buffer, staging.allocation);
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo cmd_alloc = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = context.command_pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	if (vkAllocateCommandBuffers(context.device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate command buffer for transfer\n";
+		vmaDestroyBuffer(context.allocator, buffer, allocation);
+		vmaDestroyBuffer(context.allocator, staging.buffer, staging.allocation);
+		return false;
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vkBeginCommandBuffer(cmd, &begin_info);
+
+	VkBufferCopy copy_region = { .srcOffset = 0, .dstOffset = 0, .size = size };
+	vkCmdCopyBuffer(cmd, staging.buffer, buffer, 1, &copy_region);
+
+	vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &cmd,
+	};
+	vkQueueSubmit(context.graphics_queue, 1, &submit, VK_NULL_HANDLE);
+	vkQueueWaitIdle(context.graphics_queue);
+
+	vkFreeCommandBuffers(context.device, context.command_pool, 1, &cmd);
+	vmaDestroyBuffer(context.allocator, staging.buffer, staging.allocation);
+	return true;
+}
+
+bool createMesh(Mesh& mesh, const std::vector<Vertex>& vertices, const char* name) {
+	const VkDeviceSize size = vertices.size() * sizeof(Vertex);
+	if (!createDeviceLocalBuffer(mesh.buffer, mesh.allocation, size,
+	                             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), name)) {
+		return false;
+	}
 	mesh.vertex_count = static_cast<uint32_t>(vertices.size());
-	return uploadToBuffer(host, vertices.data(), vertices.size() * sizeof(Vertex));
+	return true;
+}
+
+bool createTextureFromFile(Texture& texture, const char* path) {
+	auto& context = graphics::internal::context;
+
+	int width, height, channels;
+	stbi_uc* pixels = stbi_load(path, &width, &height, &channels, STBI_rgb_alpha);
+	if (!pixels) {
+		std::cerr << "Failed to load texture: " << path << " (" << stbi_failure_reason() << ")\n";
+		width = 1;
+		height = 1;
+		pixels = static_cast<stbi_uc*>(std::malloc(4));
+		pixels[0] = pixels[1] = pixels[2] = pixels[3] = 255;
+	}
+
+	const VkDeviceSize image_size = static_cast<VkDeviceSize>(width) * height * 4;
+
+	HostBuffer staging{};
+	if (!createHostBuffer(staging, image_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, "texture staging")) {
+		stbi_image_free(pixels);
+		return false;
+	}
+	std::memcpy(staging.data, pixels, static_cast<size_t>(image_size));
+	vmaFlushAllocation(context.allocator, staging.allocation, 0, image_size);
+	stbi_image_free(pixels);
+
+	const VkImageCreateInfo image_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = VK_FORMAT_R8G8B8A8_SRGB,
+		.extent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	const VmaAllocationCreateInfo alloc_info = {
+		.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+	};
+	if (vmaCreateImage(context.allocator, &image_info, &alloc_info, &texture.image,
+	                   &texture.allocation, nullptr) != VK_SUCCESS) {
+		std::cerr << "Failed to create texture image\n";
+		vmaDestroyBuffer(context.allocator, staging.buffer, staging.allocation);
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo cmd_alloc = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = context.command_pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	};
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	vkAllocateCommandBuffers(context.device, &cmd_alloc, &cmd);
+
+	VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vkBeginCommandBuffer(cmd, &begin_info);
+
+	VkImageMemoryBarrier barrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = texture.image,
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+	};
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+	VkBufferImageCopy region = {
+		.bufferOffset = 0,
+		.bufferRowLength = 0,
+		.bufferImageHeight = 0,
+		.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+		.imageOffset = { 0, 0, 0 },
+		.imageExtent = { static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1 },
+	};
+	vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                       1, &region);
+
+	barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                     0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+	vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit = {
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &cmd,
+	};
+	vkQueueSubmit(context.graphics_queue, 1, &submit, VK_NULL_HANDLE);
+	vkQueueWaitIdle(context.graphics_queue);
+	vkFreeCommandBuffers(context.device, context.command_pool, 1, &cmd);
+	vmaDestroyBuffer(context.allocator, staging.buffer, staging.allocation);
+
+	const VkImageViewCreateInfo view_info = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = texture.image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = VK_FORMAT_R8G8B8A8_SRGB,
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+	};
+	if (vkCreateImageView(context.device, &view_info, nullptr, &texture.view) != VK_SUCCESS) {
+		std::cerr << "Failed to create texture image view\n";
+		return false;
+	}
+
+	const VkSamplerCreateInfo sampler_info = {
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.magFilter = VK_FILTER_LINEAR,
+		.minFilter = VK_FILTER_LINEAR,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.anisotropyEnable = VK_FALSE,
+		.maxAnisotropy = 1.0f,
+		.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+		.unnormalizedCoordinates = VK_FALSE,
+	};
+	if (vkCreateSampler(context.device, &sampler_info, nullptr, &texture.sampler) != VK_SUCCESS) {
+		std::cerr << "Failed to create texture sampler\n";
+		return false;
+	}
+
+	texture.width = static_cast<uint32_t>(width);
+	texture.height = static_cast<uint32_t>(height);
+	return true;
 }
 
 bool createDescriptors() {
 	auto& context = graphics::internal::context;
 
-	const VkDescriptorSetLayoutBinding scene_binding = {
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	VkPhysicalDeviceProperties props{};
+	vkGetPhysicalDeviceProperties(context.physical_device, &props);
+	model_uniform_alignment = props.limits.minUniformBufferOffsetAlignment;
+	model_uniform_size = (sizeof(ModelUniform) + model_uniform_alignment - 1) /
+	                     model_uniform_alignment * model_uniform_alignment;
+
+	const VkDescriptorSetLayoutBinding bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
-	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
+	const VkDescriptorSetLayoutCreateInfo layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &scene_binding,
+		.bindingCount = 3,
+		.pBindings = bindings,
 	};
-	if (vkCreateDescriptorSetLayout(context.device, &scene_layout_info, nullptr,
-	                                &scene_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create scene descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(context.device, &layout_info, nullptr,
+	                                &descriptor_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create descriptor set layout\n";
 		return false;
 	}
 
-	const VkDescriptorSetLayoutBinding model_binding = {
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	const VkDescriptorPoolSize pool_sizes[] = {
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 },
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
+		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
 	};
-	const VkDescriptorSetLayoutCreateInfo model_layout_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &model_binding,
-	};
-	if (vkCreateDescriptorSetLayout(context.device, &model_layout_info, nullptr,
-	                                &model_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create model descriptor set layout\n";
-		return false;
-	}
-
-	const VkDescriptorPoolSize pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 + model_count };
 	const VkDescriptorPoolCreateInfo pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = 1 + model_count,
-		.poolSizeCount = 1,
-		.pPoolSizes = &pool_size,
+		.maxSets = 1,
+		.poolSizeCount = 3,
+		.pPoolSizes = pool_sizes,
 	};
 	if (vkCreateDescriptorPool(context.device, &pool_info, nullptr, &descriptor_pool) !=
 	    VK_SUCCESS) {
@@ -421,27 +649,14 @@ bool createDescriptors() {
 		return false;
 	}
 
-	const VkDescriptorSetAllocateInfo scene_set_info = {
+	const VkDescriptorSetAllocateInfo set_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.descriptorPool = descriptor_pool,
 		.descriptorSetCount = 1,
-		.pSetLayouts = &scene_set_layout,
+		.pSetLayouts = &descriptor_set_layout,
 	};
-	if (vkAllocateDescriptorSets(context.device, &scene_set_info, &scene_set) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate scene descriptor set\n";
-		return false;
-	}
-
-	const VkDescriptorSetLayout model_layouts[model_count] = { model_set_layout, model_set_layout };
-	VkDescriptorSet model_sets[model_count] = {};
-	const VkDescriptorSetAllocateInfo model_set_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = descriptor_pool,
-		.descriptorSetCount = model_count,
-		.pSetLayouts = model_layouts,
-	};
-	if (vkAllocateDescriptorSets(context.device, &model_set_info, model_sets) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate model descriptor sets\n";
+	if (vkAllocateDescriptorSets(context.device, &set_info, &descriptor_set) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate descriptor set\n";
 		return false;
 	}
 
@@ -449,43 +664,59 @@ bool createDescriptors() {
 	                      "scene uniform")) {
 		return false;
 	}
-	for (size_t i = 0; i < model_count; ++i) {
-		models[i].set = model_sets[i];
-		if (!createHostBuffer(models[i].uniform, sizeof(ModelUniform),
-		                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "model uniform")) {
-			return false;
+
+	const VkDeviceSize total_model_size = model_uniform_size * model_count;
+	if (!createHostBuffer(model_uniforms_buffer, total_model_size,
+	                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, "model uniforms dynamic")) {
+		return false;
+	}
+
+	if (!createTextureFromFile(albedo_texture, "textures/texture.png")) {
+		if (!createTextureFromFile(albedo_texture, "/home/workdir/artifacts/textures/texture.png")) {
+			std::cerr << "Warning: using fallback texture\n";
 		}
 	}
 
-	const VkDescriptorBufferInfo buffer_infos[] = {
-		{ scene_buffer.buffer, 0, sizeof(SceneUniform) },
-		{ models[cylinder_index].uniform.buffer, 0, sizeof(ModelUniform) },
-		{ models[floor_index].uniform.buffer, 0, sizeof(ModelUniform) },
+	const VkDescriptorBufferInfo scene_info = {
+		.buffer = scene_buffer.buffer,
+		.offset = 0,
+		.range = sizeof(SceneUniform),
 	};
+	const VkDescriptorBufferInfo model_info = {
+		.buffer = model_uniforms_buffer.buffer,
+		.offset = 0,
+		.range = sizeof(ModelUniform),
+	};
+	const VkDescriptorImageInfo image_info = {
+		.sampler = albedo_texture.sampler,
+		.imageView = albedo_texture.view,
+		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+
 	const VkWriteDescriptorSet writes[] = {
 		{
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = scene_set,
+			.dstSet = descriptor_set,
 			.dstBinding = 0,
 			.descriptorCount = 1,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &buffer_infos[0],
+			.pBufferInfo = &scene_info,
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = models[cylinder_index].set,
-			.dstBinding = 0,
+			.dstSet = descriptor_set,
+			.dstBinding = 1,
 			.descriptorCount = 1,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &buffer_infos[1],
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+			.pBufferInfo = &model_info,
 		},
 		{
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = models[floor_index].set,
-			.dstBinding = 0,
+			.dstSet = descriptor_set,
+			.dstBinding = 2,
 			.descriptorCount = 1,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &buffer_infos[2],
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.pImageInfo = &image_info,
 		},
 	};
 	vkUpdateDescriptorSets(context.device, 3, writes, 0, nullptr);
@@ -565,8 +796,8 @@ bool createPipeline() {
 		  .offset = offsetof(Vertex, position) },
 		{ .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
 		  .offset = offsetof(Vertex, normal) },
-		{ .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
-		  .offset = offsetof(Vertex, color) },
+		{ .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,
+		  .offset = offsetof(Vertex, uv) },
 	};
 	const VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -620,13 +851,13 @@ bool createPipeline() {
 		.dynamicStateCount = 2,
 		.pDynamicStates = dynamic_states,
 	};
-	const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
 	const VkPipelineLayoutCreateInfo layout_info = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 2,
-		.pSetLayouts = set_layouts,
+		.setLayoutCount = 1,
+		.pSetLayouts = &descriptor_set_layout,
 	};
-	if (vkCreatePipelineLayout(context.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+	if (vkCreatePipelineLayout(context.device, &layout_info, nullptr, &pipeline_layout) !=
+	    VK_SUCCESS) {
 		std::cerr << "Failed to create Vulkan pipeline layout\n";
 		vkDestroyShaderModule(context.device, vertex_shader, nullptr);
 		vkDestroyShaderModule(context.device, fragment_shader, nullptr);
@@ -669,6 +900,20 @@ void destroyHostBuffer(HostBuffer& buffer) {
 	buffer = HostBuffer{};
 }
 
+void destroyTexture(Texture& texture) {
+	auto& context = graphics::internal::context;
+	if (texture.sampler != VK_NULL_HANDLE) {
+		vkDestroySampler(context.device, texture.sampler, nullptr);
+	}
+	if (texture.view != VK_NULL_HANDLE) {
+		vkDestroyImageView(context.device, texture.view, nullptr);
+	}
+	if (texture.image != VK_NULL_HANDLE) {
+		vmaDestroyImage(context.allocator, texture.image, texture.allocation);
+	}
+	texture = Texture{};
+}
+
 void destroyResources() {
 	auto& context = graphics::internal::context;
 	if (graphics_pipeline != VK_NULL_HANDLE) {
@@ -684,25 +929,20 @@ void destroyResources() {
 			vmaDestroyBuffer(context.allocator, model.mesh.buffer, model.mesh.allocation);
 		}
 		model.mesh = Mesh{};
-		destroyHostBuffer(model.uniform);
-		model.set = VK_NULL_HANDLE;
 	}
 	destroyHostBuffer(scene_buffer);
+	destroyHostBuffer(model_uniforms_buffer);
+	destroyTexture(albedo_texture);
 	if (descriptor_pool != VK_NULL_HANDLE) {
 		vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
 		descriptor_pool = VK_NULL_HANDLE;
-		scene_set = VK_NULL_HANDLE;
+		descriptor_set = VK_NULL_HANDLE;
 	}
-	if (model_set_layout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
-		model_set_layout = VK_NULL_HANDLE;
-	}
-	if (scene_set_layout != VK_NULL_HANDLE) {
-		vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
-		scene_set_layout = VK_NULL_HANDLE;
+	if (descriptor_set_layout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(context.device, descriptor_set_layout, nullptr);
+		descriptor_set_layout = VK_NULL_HANDLE;
 	}
 }
-
 
 void drawCameraWindow(float delta_time) {
 	ImGuiIO& io = ImGui::GetIO();
@@ -795,32 +1035,26 @@ void drawMaterialEditor(const char* title, Material& material) {
 }
 
 void drawObjectWindow() {
-	ImGui::Begin("Cylinder - variant 8");
-	ImGui::Text("Right circular cylinder, 50 segments per base");
+	ImGui::Begin("Cylinders");
 
-	ImGui::SeparatorText("Translation");
-	ImGui::SliderFloat3("X / Y / Z", translation, -2.0f, 2.0f);
-	ImGui::SeparatorText("Rotation (degrees)");
-	ImGui::SliderFloat3("X / Y / Z##rotation", rotation, -180.0f, 180.0f);
-	ImGui::SeparatorText("Scale");
-	ImGui::SliderFloat3("X / Y / Z##scale", scale, 0.2f, 2.0f);
-	if (ImGui::Button("Reset transformations")) {
-		translation[0] = translation[1] = translation[2] = 0.0f;
-		rotation[0] = 20.0f;
-		rotation[1] = -25.0f;
-		rotation[2] = 0.0f;
-		scale[0] = scale[1] = scale[2] = 1.0f;
-	}
+	ImGui::SeparatorText("Cylinder 1");
+	ImGui::SliderFloat3("Translation##0", translation0, -3.0f, 3.0f);
+	ImGui::SliderFloat3("Rotation##0", rotation0, -180.0f, 180.0f);
+	ImGui::SliderFloat3("Scale##0", scale0, 0.2f, 2.0f);
+	drawMaterialEditor("Material 1", materials[0]);
 
-	drawMaterialEditor("Cylinder material", materials[cylinder_index]);
-	drawMaterialEditor("Floor material", materials[floor_index]);
+	ImGui::SeparatorText("Cylinder 2");
+	ImGui::SliderFloat3("Translation##1", translation1, -3.0f, 3.0f);
+	ImGui::SliderFloat3("Rotation##1", rotation1, -180.0f, 180.0f);
+	ImGui::SliderFloat3("Scale##1", scale1, 0.2f, 2.0f);
+	drawMaterialEditor("Material 2", materials[1]);
 
-	ImGui::SeparatorText("Animation trajectory");
-	if (ImGui::Button(animation_playing ? "Pause animation" : "Play animation")) {
+	ImGui::SeparatorText("Animation");
+	if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
 		animation_playing = !animation_playing;
 	}
 	ImGui::SameLine();
-	if (ImGui::Button("Restart trajectory")) {
+	if (ImGui::Button("Restart")) {
 		animation_phase = 0.0f;
 	}
 	ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 3.0f);
@@ -842,12 +1076,15 @@ void fillModelUniform(ModelUniform& uniform, const Matrix& model, const Matrix& 
 	}
 	uniform.albedo[3] = 1.0f;
 	uniform.specular[3] = material.shininess;
+	for (int i = 0; i < 4; ++i) uniform._pad[i] = 0.0f;
 }
 
+} 
 
 bool initialize() {
-	if (!createMesh(models[cylinder_index].mesh, createCylinder(), "cylinder vertices") ||
-	    !createMesh(models[floor_index].mesh, createFloor(), "floor vertices") ||
+	std::vector<Vertex> cylinder_vertices = createCylinder();
+	if (!createMesh(models[0].mesh, cylinder_vertices, "cylinder 0") ||
+	    !createMesh(models[1].mesh, cylinder_vertices, "cylinder 1") ||
 	    !createDescriptors() || !createPipeline()) {
 		destroyResources();
 		return false;
@@ -904,31 +1141,39 @@ void render(const graphics::internal::FrameData& fd) {
 	const float animated_x = trajectory_radius * std::cos(animation_phase);
 	const float animated_y = trajectory_height * std::sin(trajectory_frequency * animation_phase);
 	const float animated_z = trajectory_depth * std::sin(2.0f * animation_phase);
-	const Matrix rotation_matrix = multiply(
-		rotationZ(rotation[2]),
-		multiply(rotationY(rotation[1] + animation_phase * animation_rotation_speed),
-		         rotationX(rotation[0])));
-	const Matrix cylinder_model = multiply(
-		translationMatrix(translation[0] + animated_x,
-		                  translation[1] + animated_y,
-		                  translation[2] + animated_z),
-		multiply(rotation_matrix, scaleMatrix(scale[0], scale[1], scale[2])));
-	const Matrix cylinder_normal_matrix = multiply(
-		rotation_matrix, scaleMatrix(1.0f / scale[0], 1.0f / scale[1], 1.0f / scale[2]));
 
-	ModelUniform cylinder_uniform{};
-	fillModelUniform(cylinder_uniform, cylinder_model, cylinder_normal_matrix,
-	                 materials[cylinder_index]);
-	ModelUniform floor_uniform{};
-	fillModelUniform(floor_uniform, translationMatrix(0.0f, floor_height, 0.0f), identityMatrix(),
-	                 materials[floor_index]);
+	const Matrix rot0 = multiply(
+		rotationZ(rotation0[2]),
+		multiply(rotationY(rotation0[1] + animation_phase * animation_rotation_speed),
+		         rotationX(rotation0[0])));
+	const Matrix model0 = multiply(
+		translationMatrix(translation0[0] + animated_x, translation0[1] + animated_y, translation0[2] + animated_z),
+		multiply(rot0, scaleMatrix(scale0[0], scale0[1], scale0[2])));
+	const Matrix normal0 = multiply(rot0, scaleMatrix(1.0f / scale0[0], 1.0f / scale0[1], 1.0f / scale0[2]));
 
-	if (!uploadToBuffer(scene_buffer, &scene_data, sizeof(scene_data)) ||
-	    !uploadToBuffer(models[cylinder_index].uniform, &cylinder_uniform,
-	                    sizeof(cylinder_uniform)) ||
-	    !uploadToBuffer(models[floor_index].uniform, &floor_uniform, sizeof(floor_uniform))) {
+	const Matrix rot1 = multiply(
+		rotationZ(rotation1[2]),
+		multiply(rotationY(rotation1[1] - animation_phase * animation_rotation_speed * 0.7f),
+		         rotationX(rotation1[0])));
+	const Matrix model1 = multiply(
+		translationMatrix(translation1[0] - animated_x * 0.6f, translation1[1] + animated_y * 0.8f, translation1[2] - animated_z),
+		multiply(rot1, scaleMatrix(scale1[0], scale1[1], scale1[2])));
+	const Matrix normal1 = multiply(rot1, scaleMatrix(1.0f / scale1[0], 1.0f / scale1[1], 1.0f / scale1[2]));
+
+	ModelUniform uniforms[model_count];
+	fillModelUniform(uniforms[0], model0, normal0, materials[0]);
+	fillModelUniform(uniforms[1], model1, normal1, materials[1]);
+
+	if (!uploadToBuffer(scene_buffer, &scene_data, sizeof(scene_data))) {
 		return;
 	}
+
+	for (size_t i = 0; i < model_count; ++i) {
+		std::memcpy(static_cast<char*>(model_uniforms_buffer.data) + i * model_uniform_size,
+		            &uniforms[i], sizeof(ModelUniform));
+	}
+	vmaFlushAllocation(context.allocator, model_uniforms_buffer.allocation, 0,
+	                   model_uniform_size * model_count);
 
 	const VkCommandBufferBeginInfo command_buffer_begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -963,15 +1208,14 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 	vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
 
-	vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-	                        0, 1, &scene_set, 0, nullptr);
-
-	for (const Model& model : models) {
+	for (size_t i = 0; i < model_count; ++i) {
+		uint32_t dynamic_offset = static_cast<uint32_t>(i * model_uniform_size);
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-		                        1, 1, &model.set, 0, nullptr);
+		                        0, 1, &descriptor_set, 1, &dynamic_offset);
+
 		const VkDeviceSize vertex_offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &model.mesh.buffer, &vertex_offset);
-		vkCmdDraw(fd.command_buffer, model.mesh.vertex_count, 1, 0, 0);
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &models[i].mesh.buffer, &vertex_offset);
+		vkCmdDraw(fd.command_buffer, models[i].mesh.vertex_count, 1, 0, 0);
 	}
 
 	vkCmdEndRenderPass(fd.command_buffer);
@@ -980,4 +1224,4 @@ void render(const graphics::internal::FrameData& fd) {
 	}
 }
 
-}
+} // namespace application

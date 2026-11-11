@@ -15,6 +15,7 @@ struct Context {
 	VkDevice device;
 
 	VmaAllocator allocator;
+	VkCommandPool command_pool;
 
 	VkQueue graphics_queue;
 	uint32_t graphics_queue_index;
