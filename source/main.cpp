@@ -63,7 +63,7 @@ int main() {
 	if (!graphics::internal::initialize(glfw_window)) {
 		std::cerr << "Failed to initialize graphics\n";
 		status = EXIT_FAILURE;
-		goto err_graphics_init;
+		goto err_imgui_glfw_init;
 	}
 
 	if (!application::initialize()) {
@@ -90,7 +90,6 @@ int main() {
 	application::shutdown();
 err_application_init:
 	graphics::internal::shutdown();
-err_graphics_init:
 	ImGui_ImplGlfw_Shutdown();
 err_imgui_glfw_init:
 	ImGui::DestroyContext();
@@ -99,5 +98,5 @@ err_imgui_init:
 err_null_window:
 	glfwTerminate();
 
-	return 0;
+	return status;
 }

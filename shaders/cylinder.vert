@@ -6,6 +6,7 @@ layout(location = 2) in vec2 inUV;
 
 layout(set = 0, binding = 0) uniform Scene {
 	mat4 viewProjection;
+	mat4 shadowProjection;
 	vec4 cameraPosition;
 	vec4 ambient;
 	vec4 directionalDirection;
@@ -17,11 +18,13 @@ layout(set = 0, binding = 1) uniform Model {
 	mat4 normalMatrix;
 	vec4 albedo;
 	vec4 specular;
+	vec4 parameters;
 } object;
 
 layout(location = 0) out vec3 normal;
 layout(location = 1) out vec2 uv;
 layout(location = 2) out vec3 worldPosition;
+layout(location = 3) out vec4 shadowPosition;
 
 void main() {
 	vec4 world = object.model * vec4(inPosition, 1.0);
@@ -29,4 +32,5 @@ void main() {
 	normal = normalize(mat3(object.normalMatrix) * inNormal);
 	uv = inUV;
 	worldPosition = world.xyz;
+	shadowPosition = scene.shadowProjection * world;
 }

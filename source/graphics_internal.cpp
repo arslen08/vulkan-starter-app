@@ -416,6 +416,25 @@ bool initialize(GLFWwindow* const window) {
 
 	auto vkb_physical_device = pds_result.value();
 
+	const std::vector<const char*> dynamic_rendering_extensions = {
+		VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+		VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
+		VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME,
+	};
+	if (!vkb_physical_device.enable_extensions_if_present(dynamic_rendering_extensions)) {
+		std::cerr << "Selected Vulkan device is missing dynamic rendering extensions\n";
+		return false;
+	}
+
+	VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_features = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+		.dynamicRendering = VK_TRUE,
+	};
+	if (!vkb_physical_device.enable_extension_features_if_present(dynamic_rendering_features)) {
+		std::cerr << "Selected Vulkan device does not support the dynamicRendering feature\n";
+		return false;
+	}
+
 	vk_depth_buffer_format = selectDepthFormat(vkb_physical_device.physical_device);
 	if (vk_depth_buffer_format == VK_FORMAT_UNDEFINED) {
 		std::cerr << "No supported depth/stencil attachment format found\n";

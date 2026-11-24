@@ -101,6 +101,7 @@ endmacro()
 
 compile_shader(cylinder.vert)
 compile_shader(cylinder.frag)
+compile_shader(shadow.vert)
 
 add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 add_dependencies(${PROJECT_NAME} shaders)
